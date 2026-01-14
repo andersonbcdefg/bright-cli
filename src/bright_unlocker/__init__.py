@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, BinaryIO, Dict, Optional
+from typing import Any, AsyncIterator, BinaryIO, Dict, List, Optional
 
 import aiohttp
+import pandas as pd
 from dotenv import load_dotenv
 
 DEFAULT_ENDPOINT = "https://api.brightdata.com/request"
@@ -37,6 +39,27 @@ def _init_config(api_key: str, zone: str | None = None) -> None:
 
 
 CHUNK_SIZE = 64 * 1024
+
+
+def _load_urls(file_path: str, field: str | None = None) -> List[str]:
+    """Load URLs from a txt, csv, or jsonl file."""
+    path = Path(file_path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".txt":
+        return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+    elif suffix == ".csv":
+        if not field:
+            raise ValueError("--field is required for CSV files")
+        df = pd.read_csv(path)
+        return df[field].dropna().astype(str).tolist()
+    elif suffix in (".jsonl", ".ndjson"):
+        if not field:
+            raise ValueError("--field is required for JSONL files")
+        df = pd.read_json(path, lines=True)
+        return df[field].dropna().astype(str).tolist()
+    else:
+        raise ValueError(f"Unsupported file type: {suffix}. Use .txt, .csv, or .jsonl")
 
 
 class BrightDataError(RuntimeError):
@@ -281,6 +304,66 @@ async def _cli_scrape(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cli_batch(args: argparse.Namespace) -> int:
+    api_key = args.api_key
+    zone = args.zone
+    endpoint = args.endpoint
+    data_format = args.format
+    verbose = args.verbose
+    concurrency = args.concurrency
+
+    if not api_key:
+        print("Missing API key. Run 'bright init' or pass --api-key.", file=sys.stderr)
+        return 2
+    if not zone:
+        print("Missing zone. Run 'bright init' or pass --zone.", file=sys.stderr)
+        return 2
+
+    try:
+        urls = _load_urls(args.input, args.field)
+    except ValueError as e:
+        print(f"Error loading URLs: {e}", file=sys.stderr)
+        return 2
+
+    if not urls:
+        print("No URLs found in input file.", file=sys.stderr)
+        return 2
+
+    print(f"Loaded {len(urls)} URLs", file=sys.stderr)
+
+    semaphore = asyncio.Semaphore(concurrency)
+    completed = 0
+
+    async def scrape_one(client: BrightUnlocker, url: str) -> dict:
+        nonlocal completed
+        async with semaphore:
+            try:
+                resp = await client.fetch(url, data_format=data_format)
+                content = resp.text() if data_format != "screenshot" else resp.body.hex()
+                result = {"url": url, "content": content, "error": None}
+            except BrightDataError as e:
+                result = {"url": url, "content": None, "error": f"HTTP {e.status}: {e.error_detail or e.error_code or 'unknown'}"}
+                if verbose:
+                    print(f"Error scraping {url}: {result['error']}", file=sys.stderr)
+            completed += 1
+            print(f"\rProgress: {completed}/{len(urls)}", end="", file=sys.stderr)
+            return result
+
+    with open(args.output, "w") as f:
+        async with BrightUnlocker(
+            api_key=api_key, zone=zone, endpoint=endpoint, timeout_s=args.timeout
+        ) as client:
+            tasks = [scrape_one(client, url) for url in urls]
+            results = await asyncio.gather(*tasks)
+
+            for result in results:
+                f.write(json.dumps(result) + "\n")
+
+    print(file=sys.stderr)  # newline after progress
+    print(f"Results written to {args.output}", file=sys.stderr)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     _load_config()
 
@@ -329,6 +412,49 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v", "--verbose", action="store_true", help="Print more debug info to stderr"
     )
 
+    # batch subcommand
+    b = sub.add_parser("batch", help="Batch scrape URLs from a file")
+    b.add_argument("input", help="Input file (.txt, .csv, or .jsonl)")
+    b.add_argument("output", help="Output JSONL file")
+    b.add_argument(
+        "--field",
+        default=None,
+        help="Field/column name containing URLs (required for csv/jsonl)",
+    )
+    b.add_argument(
+        "--format",
+        choices=["raw", "markdown", "screenshot"],
+        default="raw",
+        help="Output format: raw (HTML), markdown, or screenshot (PNG)",
+    )
+    b.add_argument(
+        "--concurrency",
+        type=int,
+        default=5,
+        help="Number of concurrent requests (default: 5)",
+    )
+    b.add_argument(
+        "--zone",
+        default=os.getenv("BRIGHT_ZONE"),
+        help="Unlocker zone name (or set via 'bright init')",
+    )
+    b.add_argument(
+        "--api-key",
+        default=os.getenv("BRIGHT_API_KEY"),
+        help="Bright Data API key (or set via 'bright init')",
+    )
+    b.add_argument(
+        "--endpoint",
+        default=os.getenv("BRIGHT_ENDPOINT", DEFAULT_ENDPOINT),
+        help=f"API endpoint (default: {DEFAULT_ENDPOINT})",
+    )
+    b.add_argument(
+        "--timeout", type=float, default=120.0, help="Request timeout in seconds"
+    )
+    b.add_argument(
+        "-v", "--verbose", action="store_true", help="Print errors to stderr"
+    )
+
     return p
 
 
@@ -342,6 +468,9 @@ def main() -> int:
 
     if args.cmd == "scrape":
         return asyncio.run(_cli_scrape(args))
+
+    if args.cmd == "batch":
+        return asyncio.run(_cli_batch(args))
 
     return 2
 
