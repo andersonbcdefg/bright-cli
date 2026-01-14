@@ -304,6 +304,26 @@ async def _cli_scrape(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_completed_urls(output_path: str) -> set[str]:
+    """Load URLs that have already been successfully scraped from output file."""
+    completed = set()
+    path = Path(output_path)
+    if not path.exists():
+        return completed
+
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            # Only count as done if it succeeded (no error)
+            if record.get("error") is None:
+                completed.add(record["url"])
+        except json.JSONDecodeError:
+            continue
+    return completed
+
+
 async def _cli_batch(args: argparse.Namespace) -> int:
     api_key = args.api_key
     zone = args.zone
@@ -311,6 +331,7 @@ async def _cli_batch(args: argparse.Namespace) -> int:
     data_format = args.format
     verbose = args.verbose
     concurrency = args.concurrency
+    max_retries = 3
 
     if not api_key:
         print("Missing API key. Run 'bright init' or pass --api-key.", file=sys.stderr)
@@ -329,31 +350,57 @@ async def _cli_batch(args: argparse.Namespace) -> int:
         print("No URLs found in input file.", file=sys.stderr)
         return 2
 
-    print(f"Loaded {len(urls)} URLs", file=sys.stderr)
+    # Check for already completed URLs
+    already_done = _load_completed_urls(args.output)
+    urls_to_scrape = [u for u in urls if u not in already_done]
+
+    if already_done:
+        print(f"Resuming: {len(already_done)} already done, {len(urls_to_scrape)} remaining", file=sys.stderr)
+    else:
+        print(f"Loaded {len(urls_to_scrape)} URLs", file=sys.stderr)
+
+    if not urls_to_scrape:
+        print("All URLs already scraped.", file=sys.stderr)
+        return 0
 
     semaphore = asyncio.Semaphore(concurrency)
     completed = 0
+    total = len(urls_to_scrape)
 
     async def scrape_one(client: BrightUnlocker, url: str) -> dict:
         nonlocal completed
         async with semaphore:
-            try:
-                resp = await client.fetch(url, data_format=data_format)
-                content = resp.text() if data_format != "screenshot" else resp.body.hex()
-                result = {"url": url, "content": content, "error": None}
-            except BrightDataError as e:
-                result = {"url": url, "content": None, "error": f"HTTP {e.status}: {e.error_detail or e.error_code or 'unknown'}"}
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    resp = await client.fetch(url, data_format=data_format)
+                    content = resp.text() if data_format != "screenshot" else resp.body.hex()
+                    result = {"url": url, "content": content, "error": None}
+                    break
+                except BrightDataError as e:
+                    last_error = f"HTTP {e.status}: {e.error_detail or e.error_code or 'unknown'}"
+                    if verbose:
+                        print(f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}", file=sys.stderr)
+                except Exception as e:
+                    last_error = str(e) or type(e).__name__
+                    if verbose:
+                        print(f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}", file=sys.stderr)
+            else:
+                # All retries exhausted
+                result = {"url": url, "content": None, "error": last_error}
                 if verbose:
-                    print(f"Error scraping {url}: {result['error']}", file=sys.stderr)
+                    print(f"\nFailed after {max_retries} attempts: {url}", file=sys.stderr)
+
             completed += 1
-            print(f"\rProgress: {completed}/{len(urls)}", end="", file=sys.stderr)
+            print(f"\rProgress: {completed}/{total}", end="", file=sys.stderr)
             return result
 
-    with open(args.output, "w") as f:
+    # Append mode for resumability
+    with open(args.output, "a") as f:
         async with BrightUnlocker(
             api_key=api_key, zone=zone, endpoint=endpoint, timeout_s=args.timeout
         ) as client:
-            tasks = [scrape_one(client, url) for url in urls]
+            tasks = [scrape_one(client, url) for url in urls_to_scrape]
             results = await asyncio.gather(*tasks)
 
             for result in results:
