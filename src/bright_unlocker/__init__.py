@@ -395,16 +395,18 @@ async def _cli_batch(args: argparse.Namespace) -> int:
             print(f"\rProgress: {completed}/{total}", end="", file=sys.stderr)
             return result
 
-    # Append mode for resumability
-    with open(args.output, "a") as f:
-        async with BrightUnlocker(
-            api_key=api_key, zone=zone, endpoint=endpoint, timeout_s=args.timeout
-        ) as client:
-            tasks = [scrape_one(client, url) for url in urls_to_scrape]
-            results = await asyncio.gather(*tasks)
-
-            for result in results:
+    # Append mode for resumability, write as we go
+    async with BrightUnlocker(
+        api_key=api_key, zone=zone, endpoint=endpoint, timeout_s=args.timeout
+    ) as client:
+        with open(args.output, "a") as f:
+            async def scrape_and_write(url: str) -> None:
+                result = await scrape_one(client, url)
                 f.write(json.dumps(result) + "\n")
+                f.flush()
+
+            tasks = [scrape_and_write(url) for url in urls_to_scrape]
+            await asyncio.gather(*tasks)
 
     print(file=sys.stderr)  # newline after progress
     print(f"Results written to {args.output}", file=sys.stderr)
