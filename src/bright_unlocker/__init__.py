@@ -8,7 +8,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, BinaryIO, Dict, List, Optional
+from typing import Any, AsyncIterator, BinaryIO, Dict, List, Mapping, Optional
 
 import aiohttp
 import pandas as pd
@@ -108,7 +108,7 @@ def _build_payload(url: str, zone: str, data_format: str) -> Dict[str, Any]:
     return payload
 
 
-def _pick_bright_headers(headers: aiohttp.typedefs.LooseHeaders) -> Dict[str, str]:
+def _pick_bright_headers(headers: Mapping[str, Any]) -> Dict[str, str]:
     # Normalize to simple dict[str,str]
     out: Dict[str, str] = {}
     for k, v in dict(headers).items():
@@ -145,19 +145,31 @@ class BrightUnlocker:
         async with BrightUnlocker(api_key=..., zone=...) as c:
             resp = await c.fetch("https://example.com", data_format="markdown")
             print(resp.text())
+
+    Credentials can be provided via:
+      - Constructor arguments (api_key, zone)
+      - Environment variables (BRIGHT_API_KEY, BRIGHT_ZONE)
     """
 
     def __init__(
         self,
         *,
-        api_key: str,
-        zone: str,
+        api_key: Optional[str] = None,
+        zone: Optional[str] = None,
         endpoint: str = DEFAULT_ENDPOINT,
         timeout_s: float = 120.0,
         session: Optional[aiohttp.ClientSession] = None,
     ) -> None:
-        self.api_key = api_key
-        self.zone = zone
+        self.api_key = api_key or os.environ.get("BRIGHT_API_KEY")
+        self.zone = zone or os.environ.get("BRIGHT_ZONE")
+        if not self.api_key:
+            raise ValueError(
+                "api_key is required: pass it to the constructor or set BRIGHT_API_KEY"
+            )
+        if not self.zone:
+            raise ValueError(
+                "zone is required: pass it to the constructor or set BRIGHT_ZONE"
+            )
         self.endpoint = endpoint
         self.timeout_s = timeout_s
         self._external_session = session
@@ -191,7 +203,7 @@ class BrightUnlocker:
                 "BrightUnlocker must be used in an 'async with' block, or provide a session=..."
             )
 
-        payload = _build_payload(url=url, zone=self.zone, data_format=data_format)
+        payload = _build_payload(url=url, zone=self.zone, data_format=data_format)  # type: ignore[arg-type]
 
         async with self._session.post(
             self.endpoint, headers=self._headers(), json=payload
@@ -224,7 +236,7 @@ class BrightUnlocker:
                 "BrightUnlocker must be used in an 'async with' block, or provide a session=..."
             )
 
-        payload = _build_payload(url=url, zone=self.zone, data_format=data_format)
+        payload = _build_payload(url=url, zone=self.zone, data_format=data_format)  # type: ignore[arg-type]
 
         async with self._session.post(
             self.endpoint, headers=self._headers(), json=payload
@@ -281,7 +293,8 @@ async def _cli_scrape(args: argparse.Namespace) -> int:
         ) as client:
             try:
                 async for chunk in client.stream(url, data_format=data_format):
-                    sink.write(chunk)
+                    if sink is not None:
+                        sink.write(chunk)
             except BrightDataError as e:
                 print(f"Bright Data error: HTTP {e.status}", file=sys.stderr)
                 if e.error_code or e.error_detail:
@@ -355,7 +368,10 @@ async def _cli_batch(args: argparse.Namespace) -> int:
     urls_to_scrape = [u for u in urls if u not in already_done]
 
     if already_done:
-        print(f"Resuming: {len(already_done)} already done, {len(urls_to_scrape)} remaining", file=sys.stderr)
+        print(
+            f"Resuming: {len(already_done)} already done, {len(urls_to_scrape)} remaining",
+            file=sys.stderr,
+        )
     else:
         print(f"Loaded {len(urls_to_scrape)} URLs", file=sys.stderr)
 
@@ -374,22 +390,32 @@ async def _cli_batch(args: argparse.Namespace) -> int:
             for attempt in range(max_retries):
                 try:
                     resp = await client.fetch(url, data_format=data_format)
-                    content = resp.text() if data_format != "screenshot" else resp.body.hex()
+                    content = (
+                        resp.text() if data_format != "screenshot" else resp.body.hex()
+                    )
                     result = {"url": url, "content": content, "error": None}
                     break
                 except BrightDataError as e:
                     last_error = f"HTTP {e.status}: {e.error_detail or e.error_code or 'unknown'}"
                     if verbose:
-                        print(f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}", file=sys.stderr)
+                        print(
+                            f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}",
+                            file=sys.stderr,
+                        )
                 except Exception as e:
                     last_error = str(e) or type(e).__name__
                     if verbose:
-                        print(f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}", file=sys.stderr)
+                        print(
+                            f"\nRetry {attempt + 1}/{max_retries} for {url}: {last_error}",
+                            file=sys.stderr,
+                        )
             else:
                 # All retries exhausted
                 result = {"url": url, "content": None, "error": last_error}
                 if verbose:
-                    print(f"\nFailed after {max_retries} attempts: {url}", file=sys.stderr)
+                    print(
+                        f"\nFailed after {max_retries} attempts: {url}", file=sys.stderr
+                    )
 
             completed += 1
             print(f"\rProgress: {completed}/{total}", end="", file=sys.stderr)
@@ -400,6 +426,7 @@ async def _cli_batch(args: argparse.Namespace) -> int:
         api_key=api_key, zone=zone, endpoint=endpoint, timeout_s=args.timeout
     ) as client:
         with open(args.output, "a") as f:
+
             async def scrape_and_write(url: str) -> None:
                 result = await scrape_one(client, url)
                 f.write(json.dumps(result) + "\n")

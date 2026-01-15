@@ -1,0 +1,42 @@
+default_stages: [pre-commit]
+repos:
+  # entire repo - check for secrets
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.2
+    hooks:
+      - id: gitleaks
+  # make sure no file exceeds 2500 lines
+  - repo: local
+    hooks:
+      - id: max-file-lines
+        name: "Block files over 2 500 lines"
+        language: script
+        entry: scripts/max-lines-check.sh
+        files: \.(py|js|ts|tsx|jsx)$
+  # backend: linting and formatting for python/sql
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+
+    hooks:
+      # Run the linter.
+      - id: ruff
+        args: [--fix, "--config", "pyproject.toml"]
+        files: ^src/.*\.py$
+      # Run the formatter.
+      - id: ruff-format
+        args: ["--config", "pyproject.toml"]
+        files: ^src/.*\.py$
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.408
+    hooks:
+      - id: pyright
+        files: ^src/.*\.py$
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty (typecheck)
+        entry: uv run ty check src
+        language: system
+        types_or: [python, pyi]
+        files: ^src/.*\.py$
+        pass_filenames: false
